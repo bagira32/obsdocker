@@ -1,0 +1,123 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Injected events — count by spoofed host",
+      "description": "Records ingested via fluent-bit:8888 from the log-injector. Split by the (fake) `host` field in the payload.",
+      "datasource": { "type": "elasticsearch", "uid": "Elasticsearch" },
+      "id": 1,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "bars", "lineInterpolation": "linear", "fillOpacity": 60 }, "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "host:(kibana OR es01 OR app)",
+          "metrics": [{ "id": "1", "type": "count" }],
+          "bucketAggs": [
+            { "id": "3", "type": "terms", "field": "host.keyword", "settings": { "size": "10", "order": "desc", "orderBy": "_count", "min_doc_count": "0" } },
+            { "id": "2", "type": "date_histogram", "field": "@timestamp", "settings": { "interval": "30s" } }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Recon impact — log volume by container (top 8)",
+      "description": "Per-container log line rate (from FB's tail source_file). nmap sweeps light up every TCP-accepting service simultaneously.",
+      "datasource": { "type": "elasticsearch", "uid": "Elasticsearch" },
+      "id": 2,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 }, "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "_exists_:source_file",
+          "metrics": [{ "id": "1", "type": "count" }],
+          "bucketAggs": [
+            { "id": "3", "type": "terms", "field": "source_file.keyword", "settings": { "size": "8", "order": "desc", "orderBy": "_count", "min_doc_count": "0" } },
+            { "id": "2", "type": "date_histogram", "field": "@timestamp", "settings": { "interval": "30s" } }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Redis — commands processed (ops/sec) and key count",
+      "description": "Pollute→FLUSHALL cycle from redis-exploiter shows up as a saw-tooth in key count; the pipelined SETs spike ops/sec.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "id": 3,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "keys (db0)" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "short" }] },
+          { "matcher": { "id": "byName", "options": "ops/sec" }, "properties": [{ "id": "unit", "value": "ops" }] }
+        ]
+      },
+      "targets": [
+        { "refId": "A", "expr": "rate(redis_commands_processed_total[1m])", "legendFormat": "ops/sec" },
+        { "refId": "B", "expr": "redis_db_keys{db=\"db0\"}", "legendFormat": "keys (db0)" }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Suspicious payloads & refusals (recent)",
+      "description": "Records matching attacker signatures: XSS, SQLi-shaped, fake auth events, Redis DEBUG refusal, oversized blob, nmap NSE strings.",
+      "datasource": { "type": "elasticsearch", "uid": "Elasticsearch" },
+      "id": 4,
+      "gridPos": { "h": 14, "w": 12, "x": 12, "y": 9 },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "\"<script>\" OR \"OR 1=1\" OR \"auth.success\" OR \"DEBUG command\" OR \"REPLICAOF\" OR \"nmap\" OR _exists_:blob",
+          "metrics": [{ "id": "1", "type": "logs" }],
+          "bucketAggs": []
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["obsdocker", "attack"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Attack overview",
+  "uid": "obs-attack-overview",
+  "version": 1,
+  "weekStart": ""
+}

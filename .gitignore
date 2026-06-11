@@ -1,0 +1,31 @@
+# --- Environment & secrets ---
+# Commit .env.example instead; never commit the real .env
+.env
+.env.local
+.env.*.local
+
+# --- Claude Code local settings (tool permissions, user-specific) ---
+.claude/settings.local.json
+
+# --- Runtime / profiling artifacts ---
+perf.data
+perf.data.*
+
+# --- Docker volumes & generated data ---
+# (volumes live outside the project dir by default, but guard against
+#  any accidental bind-mount dumps landing here)
+volumes/
+data/
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

