@@ -34,8 +34,13 @@ x-es-common: &es-common
   environment: &es-env
     cluster.name: obs-cluster
     cluster.initial_master_nodes: es01,es02,es03
-    xpack.security.enabled: "false"
+    xpack.security.enabled: "true"
     xpack.security.enrollment.enabled: "false"
+    xpack.security.transport.ssl.enabled: "true"
+    xpack.security.transport.ssl.verification_mode: certificate
+    xpack.security.transport.ssl.certificate_authorities: /usr/share/elasticsearch/config/certs/ca/ca.crt
+    xpack.security.http.ssl.enabled: "false"
+    ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
     ES_JAVA_OPTS: -Xms${ES_HEAP} -Xmx${ES_HEAP}
     action.destructive_requires_name: "true"
     bootstrap.memory_lock: "true"
@@ -47,7 +52,7 @@ x-es-common: &es-common
       aliases:
         - elasticsearch
   healthcheck:
-    test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(yellow|green)\"'"]
+    test: ["CMD-SHELL", "curl -sf -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(yellow|green)\"'"]
     interval: 10s
     timeout: 5s
     retries: 30
@@ -147,40 +152,87 @@ services:
       retries: 20
       start_period: 60s
 
+  # ---------- TLS certificate bootstrap (exits on completion) ----------
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION}
+    container_name: es-setup
+    user: "0"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        CERTS=/usr/share/elasticsearch/config/certs
+        if [ ! -f "$$CERTS/ca/ca.crt" ]; then
+          echo "Generating CA..."
+          elasticsearch-certutil ca --silent --pem -out "$$CERTS/ca.zip"
+          unzip -qo "$$CERTS/ca.zip" -d "$$CERTS"
+          echo "Generating node certificates..."
+          printf 'instances:\n  - name: es01\n    dns:\n      - es01\n      - localhost\n  - name: es02\n    dns:\n      - es02\n      - localhost\n  - name: es03\n    dns:\n      - es03\n      - localhost\n' > /tmp/instances.yml
+          elasticsearch-certutil cert --silent --pem \
+            --ca-cert "$$CERTS/ca/ca.crt" \
+            --ca-key "$$CERTS/ca/ca.key" \
+            --in /tmp/instances.yml \
+            -out "$$CERTS/certs.zip"
+          unzip -qo "$$CERTS/certs.zip" -d "$$CERTS"
+          chmod -R a+r "$$CERTS"
+          echo "Certificates generated."
+        else
+          echo "Certificates already present, skipping."
+        fi
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    networks:
+      - obs
+
   # ---------- Elasticsearch (3-node cluster, all master+data) ----------
   es01:
     <<: *es-common
     container_name: es01
     hostname: es01
+    depends_on:
+      setup: { condition: service_completed_successfully }
     environment:
       <<: *es-env
       node.name: es01
       discovery.seed_hosts: es02,es03
+      xpack.security.transport.ssl.certificate: /usr/share/elasticsearch/config/certs/es01/es01.crt
+      xpack.security.transport.ssl.key: /usr/share/elasticsearch/config/certs/es01/es01.key
     ports:
       - "${BIND}:9200:9200"
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - es01-data:/usr/share/elasticsearch/data
 
   es02:
     <<: *es-common
     container_name: es02
     hostname: es02
+    depends_on:
+      setup: { condition: service_completed_successfully }
     environment:
       <<: *es-env
       node.name: es02
       discovery.seed_hosts: es01,es03
+      xpack.security.transport.ssl.certificate: /usr/share/elasticsearch/config/certs/es02/es02.crt
+      xpack.security.transport.ssl.key: /usr/share/elasticsearch/config/certs/es02/es02.key
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - es02-data:/usr/share/elasticsearch/data
 
   es03:
     <<: *es-common
     container_name: es03
     hostname: es03
+    depends_on:
+      setup: { condition: service_completed_successfully }
     environment:
       <<: *es-env
       node.name: es03
       discovery.seed_hosts: es01,es02
+      xpack.security.transport.ssl.certificate: /usr/share/elasticsearch/config/certs/es03/es03.crt
+      xpack.security.transport.ssl.key: /usr/share/elasticsearch/config/certs/es03/es03.key
     volumes:
+      - certs:/usr/share/elasticsearch/config/certs:ro
       - es03-data:/usr/share/elasticsearch/data
 
   # ---------- Kibana ----------
@@ -195,6 +247,9 @@ services:
       es03: { condition: service_healthy }
     environment:
       ELASTICSEARCH_HOSTS: '["http://es01:9200","http://es02:9200","http://es03:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_SYSTEM_PASSWORD}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
       SERVER_PUBLICBASEURL: http://localhost:5601
     ports:
       - "${BIND}:5601:5601"
@@ -216,6 +271,7 @@ services:
       - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - /var/log/journal:/var/log/journal:ro
+      - /var/log/audit:/var/log/audit:ro
       - /etc/machine-id:/etc/machine-id:ro
       - fluent-bit-state:/var/lib/fluent-bit
     ports:
@@ -316,6 +372,83 @@ services:
       - "${BIND}:9090:9090"
     networks:
       - obs
+
+  # ---------- Postgres (system of record for the products-api demo) ----------
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: postgres
+    hostname: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: products
+      POSTGRES_USER: products
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${BIND}:15432:5432"
+    networks:
+      - obs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U products -d products"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------- Products API (FastAPI + asyncpg, cache-aside on the redis above) ----------
+  products-api:
+    build:
+      context: ./api
+    container_name: products-api
+    hostname: products-api
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql://products:${POSTGRES_PASSWORD}@postgres:5432/products
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS}
+      LOG_LEVEL: info
+    ports:
+      - "${BIND}:8000:8000"
+    networks:
+      - obs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------- Optional: products-api traffic generator (profile=demo) ----------
+  # Repeats GETs on the seeded ids (1-5) to drive cache hits within the TTL,
+  # plus periodic POST/PUT to keep exercising misses and invalidation.
+  products-traffic:
+    image: curlimages/curl:8.10.1
+    container_name: products-traffic
+    restart: unless-stopped
+    profiles: ["demo"]
+    depends_on:
+      products-api: { condition: service_healthy }
+    networks:
+      - obs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        API=http://products-api:8000
+        while true; do
+          for id in 1 2 3 4 5; do
+            curl -fsS "$$API/products/$$id" >/dev/null || true
+          done
+          curl -fsS -X POST -H 'content-type: application/json' \
+            -d '{"name":"demo-widget","price":9.99,"stock":100}' "$$API/products" >/dev/null || true
+          curl -fsS -X PUT -H 'content-type: application/json' \
+            -d '{"name":"widget-updated","price":12.5,"stock":50}' "$$API/products/1" >/dev/null || true
+          sleep 2
+        done
 
   # ---------- Optional: synthetic log generator (profile=demo) ----------
   # Uses the fluentd docker log driver so its logs go directly to fluent-bit's
@@ -489,6 +622,7 @@ networks:
     driver: bridge
 
 volumes:
+  certs:
   es01-data:
   es02-data:
   es03-data:
@@ -499,3 +633,4 @@ volumes:
   grafana-data:
   fluent-bit-state:
   prometheus-data:
+  postgres-data:

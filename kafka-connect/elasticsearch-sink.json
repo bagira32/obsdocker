@@ -5,6 +5,8 @@
     "tasks.max": "2",
     "topics": "logs,flog-logs",
     "connection.url": "http://es01:9200,http://es02:9200,http://es03:9200",
+    "connection.username": "elastic",
+    "connection.password": "changeme",
     "key.ignore": "true",
     "schema.ignore": "true",
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
@@ -18,6 +20,7 @@
     "data.stream.dataset": "fluentbit",
     "data.stream.timestamp.field": "@timestamp",
     "flush.timeout.ms": "20000",
+    "read.timeout.ms": "30000",
     "max.buffered.records": "20000",
     "batch.size": "2000",
     "linger.ms": "1000"
