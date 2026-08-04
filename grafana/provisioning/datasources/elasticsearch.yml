@@ -4,7 +4,9 @@ datasources:
   - name: Elasticsearch
     type: elasticsearch
     access: proxy
-    url: http://es01:9200
+    url: http://elasticsearch:9200
+    basicAuth: true
+    basicAuthUser: elastic
     isDefault: true
     editable: true
     jsonData:
@@ -14,3 +16,5 @@ datasources:
       logMessageField: log
       logLevelField: level
       maxConcurrentShardRequests: 5
+    secureJsonData:
+      basicAuthPassword: ${ELASTIC_PASSWORD}
