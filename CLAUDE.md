@@ -11,6 +11,7 @@ A learning/dev observability stack, **all in docker-compose**, intended to run o
 ```
 [docker container logs (/var/lib/docker/containers/*/*.log)]
 [host journald (/var/log/journal)]                            ┐
+[host auditd  (/var/log/audit/audit.log)]                      │
 [HTTP push   :8888]                                            ├─► fluent-bit ─► kafka (3 brokers, KRaft) ─► kafka-connect (ES sink) ─► elasticsearch ─► kibana
 [Fluent Fwd  :24224]                                          ┘                                                                         └─► grafana ◄─┐
                                                                                                                                                       │
@@ -33,14 +34,16 @@ ES cluster: 3 nodes (`es01`, `es02`, `es03`), all master+data eligible, cluster 
 | # | Decision | Reasoning |
 |---|----------|-----------|
 | 1 | Topology = Fluent Bit → Kafka → ES (via Kafka Connect sink), no second FB tier | User pick. Cleaner than dual-FB tier; Connect handles ES indexing concerns. |
-| 2 | Inputs = Docker container logs + journald + HTTP + Forward | User pick. Covers the host-level demo and a network-push surface. |
+| 2 | Inputs = Docker container logs + journald + **auditd** + HTTP + Forward | User pick. Covers the host-level demo and a network-push surface. Auditd tail (`/var/log/audit/audit.log`, tag `host.audit`, parser `auditd`) is the highest-volume source in practice (~2.3M records); routed to topic `logs` via the `host\..*` arm of `Match_Regex`. |
 | 3 | ~~Sizing = ES single-node, Kafka 3 brokers~~ **Superseded by #8** | Initial pick for modest footprint. |
-| 4 | Security = none (xpack.security disabled, no TLS, no SASL) | User pick. **All host ports bound to 127.0.0.1 only** as the mitigation. |
+| 4 | Security = **xpack.security enabled, transport TLS + cert auth, HTTP plain (no TLS), no SASL** | `xpack.security.enabled=true`; inter-node transport uses TLS cert auth (certs volume mounted on all three ES nodes); HTTP port 9200 does NOT use TLS (`xpack.security.http.ssl.enabled=false`). Credentials: `elastic / changeme` (sourced from `${ELASTIC_PASSWORD}` in `.env`). **All host ports bound to 127.0.0.1 only** as the network mitigation. |
 | 5 | Kafka in KRaft mode (no Zookeeper) | Modern default; one fewer service. |
 | 6 | ES index strategy = data stream (not daily indices) | 8.x native; rollover handled by ES. |
 | 7 | ES sink installed at container start via `confluent-hub install` (cached on a volume) | Avoids building a custom image; one-time install per volume. |
 | 8 | Sizing = **ES 3-node cluster (all master+data)**, Kafka 3 brokers | User pick. Exercises real ES cluster behavior (master election, shard allocation, replicas) at the cost of ~3× ES memory. All three nodes share a docker network alias `elasticsearch` so downstream services can also reach the cluster via a single name. |
 | 9 | Metrics pipeline = single Prometheus instance, Grafana as Prometheus client | User pick. Added a parallel metrics path alongside the log pipeline so the stack can observe more than just logs. Redis is the first observed source (via `redis_exporter`); host metrics (`node_exporter`) deferred. |
+| 10 | `products-api` = FastAPI + asyncpg + cache-aside on the *existing* `redis` container (no second cache) | User pick. Demo REST service to exercise read-through/write-invalidate caching alongside the log/metrics pipelines already in place. Cache key `product:{id}`, TTL 30s (`CACHE_TTL_SECONDS`). Exposes its own `/metrics` (Prometheus) and JSON logs to stdout (auto-tailed by Fluent Bit like every other service). |
+| 11 | Postgres persisted via named volume (`postgres-data`), unlike ephemeral `redis` | Postgres is now a system of record (the `products` table), not a cache — losing it on restart would defeat the CRUD demo. Schema/seed applied once via `postgres/init/001_products.sql` (official image's `/docker-entrypoint-initdb.d/` mechanism). |
 
 ## Service inventory
 
@@ -63,6 +66,9 @@ ES cluster: 3 nodes (`es01`, `es02`, `es03`), all master+data eligible, cluster 
 | log-injector  | curlimages/curl:8.10.1                         | -             | -                     | `--profile attack` only; POSTs crafted JSON to `fluent-bit:8888` (spoofed host, XSS/SQLi payloads, oversized field, malformed JSON) |
 | redis-exploiter | redis:7.4-alpine                             | -             | -                     | `--profile attack` only; drives the unauthenticated-Redis playbook (FLUSHALL, CONFIG SET dir/dbfilename + BGSAVE, refused DEBUG, REPLICAOF) |
 | recon         | instrumentisto/nmap:7.95                       | -             | -                     | `--profile attack` only; nmap service-version + NSE HTTP discovery across every named service on the `obs` network |
+| postgres      | postgres:16-alpine                             | 5432          | 15432                 | system of record for `products` catalog; persisted via named volume `postgres-data`; seeded from `postgres/init/001_products.sql`; host port 15432 — this Kali box already runs several native Postgres clusters on 5432-5436 |
+| products-api  | build: `./api` (python:3.12-slim)              | 8000          | 8000                  | FastAPI CRUD on `products`; cache-aside GET-by-id through `redis` (key `product:{id}`, TTL 30s); `/metrics` (Prometheus), `/docs` (Swagger), `/health`; JSON logs to stdout |
+| products-traffic | curlimages/curl:8.10.1                      | -             | -                     | `--profile demo` only; loops GET (ids 1-5) + POST + PUT against `products-api` to drive cache hits/misses |
 
 ## Layout
 
@@ -73,7 +79,7 @@ obsdocker/
 ├── README.md
 ├── CLAUDE.md                            # this file
 ├── fluent-bit/
-│   ├── fluent-bit.conf                  # 4 inputs, modify filter, kafka output
+│   ├── fluent-bit.conf                  # 5 inputs (docker tail, journald, auditd, forward, http), modify filter, kafka output
 │   └── parsers.conf                     # docker JSON-file parser
 ├── kafka-connect/
 │   └── elasticsearch-sink.json          # connector config (data-stream mode)
@@ -87,9 +93,24 @@ obsdocker/
 │       ├── dashboards.yml               # provider
 │       ├── logs-overview.json
 │       ├── redis-overview.json
+│       ├── products-api-overview.json   # request rate/latency, cache hit ratio, error rate
 │       └── attack-overview.json         # `--profile attack` signals (injected events, recon impact, redis abuse)
 ├── prometheus/
-│   └── prometheus.yml                   # scrape config (self + redis-exporter)
+│   └── prometheus.yml                   # scrape config (self + redis-exporter + products-api)
+├── api/                                  # products-api: FastAPI + asyncpg + cache-aside on redis
+│   ├── app/
+│   │   ├── main.py                      # app, lifespan (db pool + redis client), instrumentator, /health
+│   │   ├── config.py                    # pydantic-settings (DATABASE_URL, REDIS_URL, CACHE_TTL_SECONDS)
+│   │   ├── db.py                        # asyncpg pool + raw-SQL CRUD
+│   │   ├── cache.py                     # redis.asyncio get/set/invalidate (key `product:{id}`)
+│   │   ├── metrics.py                   # cache hit/miss Counters
+│   │   ├── models.py                    # Pydantic Product models
+│   │   ├── logging_conf.py              # JSON stdout logging + request-timing middleware
+│   │   └── routes/products.py           # CRUD endpoints, cache-aside logic
+│   ├── requirements.txt
+│   └── Dockerfile
+├── postgres/
+│   └── init/001_products.sql            # schema + seed rows, mounted at /docker-entrypoint-initdb.d/
 ├── scripts/
 │   ├── register-connector.sh            # idempotent POST/PUT to Connect REST
 │   └── import-kibana-objects.sh         # idempotent POST to Kibana Saved Objects API (data view, attack searches, dashboard)
@@ -109,7 +130,7 @@ docker compose up -d
 ./scripts/register-connector.sh
 ./scripts/import-kibana-objects.sh        # data view + attack saved searches + dashboard
 # optional demo traffic:
-docker compose --profile demo up -d log-generator redis-benchmark
+docker compose --profile demo up -d log-generator redis-benchmark products-traffic
 # optional attack simulators (destructive against the local Redis):
 docker compose --profile attack up -d log-injector redis-exploiter recon
 ```
@@ -125,17 +146,18 @@ Health-check order is enforced via compose `depends_on: condition: service_healt
 - [x] Verified a log line traverses fluent-bit → topic `logs` → data stream `logs-fluentbit-logs` → visible in ES (Kibana/Grafana data view setup still TODO)
 - [x] Connector registered cleanly via `scripts/register-connector.sh`
 - [ ] Redis metrics pipeline validated end-to-end (redis-exporter scrape → Prometheus → Grafana Redis dashboard renders with non-zero ops/sec under `--profile demo`)
+- [x] `products-api` validated end-to-end (CRUD against Postgres, cache-aside hit/miss/invalidate against Redis, `/metrics` scraped by Prometheus, logs land in `logs-fluentbit-logs`, "Products API overview" Grafana dashboard renders under `--profile demo`)
 
 Update this checklist as items are validated.
 
 ## Known caveats / things to revisit
 
-- **No auth, no TLS.** Mitigation is `BIND=127.0.0.1` in `.env`. If we ever expose to a LAN, switch to "Basic auth, no TLS" or "Full security" — the original options we discussed.
+- **Basic auth, no HTTP TLS.** ES has `xpack.security.enabled=true` with `elastic/changeme` creds; transport between nodes uses TLS. HTTP (9200) has no TLS. Mitigation is `BIND=127.0.0.1` in `.env`. If we ever expose to a LAN, enable `xpack.security.http.ssl.enabled=true` and rotate the password.
 - **Fluent Bit tails Docker JSON log files directly.** Container names are not extracted yet (only the file path is captured as `source_file`). If we want `kubernetes.container_name`-style metadata, add a filter that joins on container_id, or move to the `forward` driver on dockerd.
 - **`container-cached.log` is excluded from the tail input.** Docker writes a protobuf-framed cache file at that name for any container using a non-`json-file`/`journald` driver (e.g. `fluentd`, `local`) so `docker logs` keeps working. Our `docker` parser is JSON-only, so without the exclude those files land in ES as raw framed bytes in the `log` field. Affected containers already ship logs to us via their actual driver (e.g. `log-generator` via the fluentd driver → forward input → `flog-logs`), so excluding the cache is the right call.
 - **Self-feedback loop in tail input.** Fluent Bit's own container logs are tailed and re-emitted, so the topic/index is dominated by FB's startup chatter on first boot. Not harmful, just noisy. To exclude, add `Exclude_Path /var/lib/docker/containers/<fluent-bit-id>*/*.log` or filter by container id.
 - **ES sink data-stream naming.** The Confluent ES sink v14.x ignores `data.stream.namespace` and uses the **Kafka topic name** as the third segment of the data-stream name. To target a different namespace, either rename the topic or apply a `RegexRouter` SMT in the connector config.
-- **Partition key for Kafka producer.** `Message_Key_Field` in fluent-bit.conf is set to `source_file` so docker-tail records spread across all 6 partitions by container id. Records without that field (HTTP/forward inputs) get round-robin partitioning, which is also fine.
+- **Partition key for Kafka producer.** `Message_Key_Field` in fluent-bit.conf is set to `source_file` so docker-tail records spread across all 6 partitions by container id. Records without that field (HTTP/forward inputs) get round-robin partitioning. **Caveat:** high-volume single-path sources (e.g. `/var/log/audit/audit.log`) hash to a single partition — auditd alone drove partition 4 of `logs` to 89% of all messages. If auditd volume stays high, consider dropping `Message_Key_Field` (round-robin) or using a higher-cardinality field.
 - **Forward input must NOT set `Tag`.** Setting `Tag X` on the `[INPUT] forward` block **overrides** any tag supplied by the client (e.g. the docker fluentd log driver's `tag: app.flog`), causing all forward traffic to be re-tagged uniformly. Per-source kafka routing then breaks because every record matches the main output. Keep the forward input tagless so client tags propagate.
 - **Restarting Fluent Bit silently breaks the docker fluentd-async producer.** With `fluentd-async=true` on the docker log driver (used by `log-generator`), dockerd buffers in memory and reconnects without surfacing errors. If FB restarts while a batch is in flight, the connection can stay dead and queued records get dropped silently. Symptoms: FB `forward.*` input stuck at 0, `kafka.*` for `flog-logs` at 0, no errors/retries/drops anywhere, but the source container keeps producing fresh logs. Fix: `docker compose --profile demo restart log-generator` to force dockerd to open a fresh forward connection. Any fluentd-driver container needs the same treatment after an FB restart.
 - **`Match` takes ONE pattern, not a space-separated list.** Fluent Bit treats the whole `Match` value as a single glob, so `Match docker.* host.* app.forward app.http` silently matches nothing (spaces aren't valid in tags). The failure is invisible — the output registers fine, `proc_records` just stays at 0 with no error/retry/drop. Use `Match_Regex ^(docker\..*|host\..*|app\.forward|app\.http)$` to route multiple tag families into one output.
@@ -143,13 +165,15 @@ Update this checklist as items are validated.
 - **ES heap is 1g per node × 3 nodes ≈ 3g total.** Drop `ES_HEAP` in `.env` if the host doesn't have the RAM; bump it if indexing slows.
 - **`bootstrap.memory_lock=true`** is set on ES so the JVM heap is mlocked. Combined with the `memlock: -1` ulimit; if the kernel refuses to lock memory on this host, set `bootstrap.memory_lock=false` in the `x-es-common` env block.
 - **`flush.timeout.ms` / `batch.size` on the ES sink** are conservative; tune if throughput rises.
+- **`postgres/init/001_products.sql` only runs once**, against an empty `$PGDATA`. Editing it after the `postgres-data` volume has been created has no effect until you `docker compose down -v` (or reseed manually via `psql`).
+- **No negative caching in `products-api`.** A `GET` on a nonexistent product id always misses cache and hits Postgres before 404ing — fine at demo scale, would need a cached "not found" sentinel or a bloom filter under real load.
+- **`products-api` / `postgres` follow the same no-auth/no-TLS posture as decision #4** (`BIND=127.0.0.1`, plaintext `POSTGRES_PASSWORD` in `.env`) — a deliberate consistency choice with the rest of the stack, not an oversight.
 
 ## Backlog (not started)
 
 - Add a Filebeat → Kafka path for comparison with Fluent Bit
 - Add `node_exporter` so Prometheus also has host metrics (Prometheus itself + first observed source landed in decision #9)
 - Add an ILM policy / data stream lifecycle for retention
-- Add a structured-log demo app (instead of just flog) to exercise level/field mapping
 - Add an index template via API at bootstrap (saved searches + attack dashboard now land via `scripts/import-kibana-objects.sh`)
 
 ## How to update this file

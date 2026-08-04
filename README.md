@@ -20,7 +20,7 @@ docker compose up -d
 ./scripts/import-kibana-objects.sh
 
 # 4. (optional) start demo workloads to produce traffic
-docker compose --profile demo up -d log-generator redis-benchmark
+docker compose --profile demo up -d log-generator redis-benchmark products-traffic
 
 # 5. (optional) start the attack simulators — see § Attack simulators
 docker compose --profile attack up -d log-injector redis-exploiter recon
@@ -42,6 +42,8 @@ docker compose --profile attack up -d log-injector redis-exploiter recon
 | Prometheus     | http://localhost:9090     | PromQL UI, target status         |
 | Redis exporter | http://localhost:9121     | `/metrics` for Prometheus        |
 | Redis          | localhost:6379            | `redis-cli -h localhost`         |
+| Products API   | http://localhost:8000     | Products CRUD, `/docs` Swagger UI, `/metrics` |
+| Postgres       | localhost:15432           | `psql -h localhost -p 15432 -U products products` (host port 15432 — this Kali box already runs several native Postgres clusters on 5432-5436) |
 
 ## Where to find logs
 
@@ -133,6 +135,39 @@ curl -s http://localhost:9121/metrics | grep -E '^redis_(memory_used_bytes|conne
 ```
 
 In **Grafana**: the `Prometheus` datasource is pre-provisioned (UID `prometheus`), and the **Redis overview** dashboard (memory, clients, hit ratio, ops/sec, keyspace hits/misses, network, evictions/expirations) is provisioned alongside `Logs overview`.
+
+## Where to find products-api cache hits
+
+`products-api` is a small FastAPI CRUD service over a `products` table in Postgres, with GET-by-id cache-aside'd through the existing `redis` container (key `product:{id}`, TTL 30s). No registration step needed — the schema/seed apply automatically on first Postgres start, and its container logs are picked up by Fluent Bit's existing `docker.*` tail like every other service (no pipeline config changes required).
+
+```bash
+# List the 5 seeded products
+curl -s http://localhost:8000/products | jq
+
+# Create one
+curl -s -X POST -H 'content-type: application/json' \
+     -d '{"name":"Test","price":19.99,"stock":10}' \
+     http://localhost:8000/products | jq
+
+# First GET on a given id is a cache miss (populates Redis)
+curl -s http://localhost:8000/products/1 >/dev/null
+docker exec redis redis-cli EXISTS product:1   # 1
+docker exec redis redis-cli TTL product:1      # ~30
+
+# Second GET within the TTL is a cache hit — confirm via the counters
+curl -s --data-urlencode 'query=products_api_cache_hits_total' \
+     http://localhost:9090/api/v1/query | jq '.data.result'
+curl -s --data-urlencode 'query=products_api_cache_misses_total' \
+     http://localhost:9090/api/v1/query | jq '.data.result'
+
+# PUT invalidates the cache entry
+curl -s -X PUT -H 'content-type: application/json' \
+     -d '{"name":"Widget","price":11.99,"stock":90}' \
+     http://localhost:8000/products/1 | jq
+docker exec redis redis-cli EXISTS product:1   # 0 — invalidated, next GET repopulates it
+```
+
+In **Grafana**: the **Products API overview** dashboard (request rate, p50/p95 latency, cache hit ratio, error rate) is provisioned alongside `Redis overview`. Start `docker compose --profile demo up -d products-traffic` to drive continuous traffic (repeated GETs on ids 1-5 plus periodic POST/PUT) and watch the hit ratio settle above 80%.
 
 ## Attack simulators
 
